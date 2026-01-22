@@ -65,6 +65,12 @@ class SkillsSection(BaseModel):
     enabled: bool = False
 
 
+class ComposerSection(BaseModel):
+    """Composer 组件配置"""
+
+    default_mode: str = "Default"
+
+
 class WorkspaceSection(BaseModel):
     workspace_dir: Optional[str] = None
     settings_dir: Optional[str] = None
@@ -86,6 +92,7 @@ class Config(BaseModel):
     checkpointing: Optional[CheckpointingSection] = None
     workspace: Optional[Union[WorkspaceSection, str]] = None
     skills: Optional[SkillsSection] = None
+    composer: ComposerSection = Field(default_factory=ComposerSection)
     meta: ConfigMeta
 
     @property

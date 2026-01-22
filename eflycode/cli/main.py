@@ -3,6 +3,8 @@
 将各个组件 Agent、UI、事件系统串联起来，实现完整的 CLI 应用
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import time
@@ -12,22 +14,20 @@ from eflycode.cli.components.composer import ComposerComponent
 from eflycode.cli.command_registry import get_command_registry
 from eflycode.cli.output import TerminalOutput
 from eflycode.core.agent.base import BaseAgent
+from eflycode.core.agent.factory import AgentFactory, AgentConfig
 from eflycode.core.agent.run_loop import AgentRunLoop
+from eflycode.core.agents.default_agent import DefaultAgent
+from eflycode.core.agents.plan_agent import PlanAgent
+from eflycode.core.agents.build_agent import BuildAgent
+from eflycode.core.agents.debug_agent import DebugAgent
+from eflycode.core.agents.ask_agent import AskAgent
 from eflycode.core.config import Config
-from eflycode.core.config.config_manager import ConfigManager, get_user_config_dir
-from eflycode.core.context.manager import ContextManager
+from eflycode.core.config.config_manager import ConfigManager
 from eflycode.core.agent.session_store import SessionStore
 from eflycode.core.llm.advisors.request_log_advisor import RequestLogAdvisor
-from eflycode.core.llm.providers.openai import OpenAiProvider
-from eflycode.core.mcp import MCPClient, MCPToolGroup, load_mcp_config
-from eflycode.core.mcp.errors import MCPConnectionError, MCPConfigError
-from eflycode.core.skills import SkillsManager
-from eflycode.core.skills.activate_tool import ActivateSkillTool
-from eflycode.core.skills.skills_advisor import SkillsAdvisor
-from eflycode.core.tool.execute_command_tool import ExecuteCommandTool
-from eflycode.core.tool.file_system_tool import FILE_SYSTEM_TOOL_GROUP
 from eflycode.core.ui.bridge import EventBridge
 from eflycode.core.ui.errors import UserCanceledError
+from eflycode.core.ui.mode import ComposerMode
 from eflycode.core.ui.renderer import Renderer
 from eflycode.core.ui.ui_event_queue import UIEventQueue
 from eflycode.core.utils.file_manager import get_file_manager
@@ -44,6 +44,35 @@ class ApplicationContext:
     output: TerminalOutput | None = None
     renderer: Renderer | None = None
     event_bridge: EventBridge | None = None
+
+    # 新增字段：多智能体支持
+    current_agent: BaseAgent | None = None  # 当前 Agent 实例
+    agent_factory: 'AgentFactory' | None = None  # Agent 工厂引用
+
+    def switch_agent_mode(self, target_mode: ComposerMode) -> None:
+        """切换 Agent 模式
+
+        Args:
+            target_mode: 目标模式
+        """
+        if not self.agent_factory:
+            logger.warning("AgentFactory 未初始化，无法切换模式")
+            return
+
+        if not self.current_agent:
+            logger.warning("当前没有 Agent 实例，无法切换模式")
+            return
+
+        # 切换 Agent
+        new_agent = self.agent_factory.switch_agent(
+            current_agent=self.current_agent,
+            target_mode=target_mode,
+            config=self.config,
+        )
+
+        self.current_agent = new_agent
+
+        logger.info(f"ApplicationContext Agent 已切换: {target_mode.value}")
 
 
 def initialize_application(setup_ui: bool = False) -> ApplicationContext:
@@ -68,6 +97,15 @@ def initialize_application(setup_ui: bool = False) -> ApplicationContext:
     
     app_context = ApplicationContext(config=config)
 
+    # 初始化 AgentFactory 并注册所有 Agent 类
+    agent_factory = AgentFactory.get_instance()
+    agent_factory.register_agent(ComposerMode.DEFAULT, DefaultAgent)
+    agent_factory.register_agent(ComposerMode.PLAN, PlanAgent)
+    agent_factory.register_agent(ComposerMode.BUILD, BuildAgent)
+    agent_factory.register_agent(ComposerMode.DEBUG, DebugAgent)
+    agent_factory.register_agent(ComposerMode.ASK, AskAgent)
+    app_context.agent_factory = agent_factory
+
     if setup_ui:
         ui_queue = UIEventQueue()
         output = TerminalOutput()
@@ -90,6 +128,7 @@ def initialize_application(setup_ui: bool = False) -> ApplicationContext:
                 "agent.tool.result",
                 "agent.tool.error",
                 "agent.error",
+                "agent.switched",  # 新增：Agent 切换事件
             ],
         )
         event_bridge.start()
@@ -113,168 +152,6 @@ def initialize_application(setup_ui: bool = False) -> ApplicationContext:
                 time.sleep(0)
 
     return app_context
-
-
-def create_agent(config: Config) -> BaseAgent:
-    """创建 Agent 实例
-
-    Args:
-        config: 配置对象
-
-    Returns:
-        BaseAgent: Agent 实例
-    """
-    # 使用文件系统工具组
-
-    # 创建执行命令工具
-    execute_command_tool = ExecuteCommandTool()
-
-    # 初始化 SkillsManager（如果启用 skills 功能）
-    user_config_dir = get_user_config_dir()
-    project_workspace_dir = config.workspace_dir
-
-    if config.skills_enabled:
-        try:
-            skills_manager = SkillsManager.get_instance()
-            skills_manager.initialize(
-                user_config_dir=user_config_dir,
-                project_workspace_dir=project_workspace_dir,
-            )
-            logger.info("Skills 功能已启用")
-        except Exception as e:
-            logger.warning(f"初始化 SkillsManager 失败: {e}，禁用 skills 功能")
-            config.skills = None  # type: ignore
-
-    # 获取最大上下文长度
-    config_manager = ConfigManager.get_instance()
-    max_context_length = config_manager.get_max_context_length()
-
-    # 加载MCP工具
-    tool_groups = [FILE_SYSTEM_TOOL_GROUP]
-    mcp_clients = []
-    
-    try:
-        mcp_server_configs = load_mcp_config()
-        # 先启动所有MCP服务器的连接，不阻塞
-        for server_config in mcp_server_configs:
-            try:
-                mcp_client = MCPClient(server_config)
-                logger.info(f"启动MCP服务器连接: {server_config.name}")
-                mcp_client.start_connect()
-                mcp_clients.append(mcp_client)
-            except Exception as e:
-                logger.warning(
-                    f"启动MCP服务器连接失败: {server_config.name}，"
-                    f"错误类型: {type(e).__name__}，"
-                    f"错误信息: {str(e)}，"
-                    f"跳过该服务器"
-                )
-                continue
-        
-        # 等待所有连接完成并加载工具
-        for mcp_client in mcp_clients:
-            try:
-                # 等待连接完成，超时时间5秒
-                if not mcp_client.wait_for_connection(timeout=5):
-                    logger.warning(
-                        f"MCP服务器连接超时: {mcp_client.server_name}，跳过"
-                    )
-                    mcp_client.disconnect()
-                    continue
-                
-                # 创建MCP工具组
-                mcp_tool_group = MCPToolGroup(mcp_client)
-                
-                # 如果工具组中有工具，添加到工具组列表
-                if mcp_tool_group.tools:
-                    tool_groups.append(mcp_tool_group)
-                    logger.info(
-                        f"MCP工具组已加载: {mcp_client.server_name}，共{len(mcp_tool_group.tools)}个工具"
-                    )
-                else:
-                    # 如果没有工具，断开连接
-                    mcp_client.disconnect()
-                    mcp_clients.remove(mcp_client)
-                    logger.warning(f"MCP服务器未提供工具: {mcp_client.server_name}")
-            except MCPConnectionError as e:
-                logger.warning(
-                    f"连接MCP服务器失败: {mcp_client.server_name}，"
-                    f"错误: {e.message}，"
-                    f"详情: {e.details if e.details else '无'}，"
-                    f"跳过该服务器"
-                )
-                try:
-                    mcp_client.disconnect()
-                    mcp_clients.remove(mcp_client)
-                except Exception:
-                    pass
-                continue
-            except Exception as e:
-                logger.warning(
-                    f"加载MCP服务器失败: {mcp_client.server_name}，"
-                    f"错误类型: {type(e).__name__}，"
-                    f"错误信息: {str(e)}，"
-                    f"跳过该服务器"
-                )
-                try:
-                    mcp_client.disconnect()
-                    mcp_clients.remove(mcp_client)
-                except Exception:
-                    pass
-                continue
-    except MCPConfigError as e:
-        logger.warning(f"加载MCP配置失败: {e.message}，继续使用内置工具")
-    except Exception as e:
-        logger.warning(
-            f"加载MCP配置时发生未知错误: {type(e).__name__}: {str(e)}，继续使用内置工具"
-        )
-
-    # 创建最终的 LLM Provider
-    provider = OpenAiProvider(config.llm_config)
-
-    # 创建 HookSystem
-    from eflycode.core.hooks.system import HookSystem
-    from pathlib import Path
-
-    workspace_dir = config.workspace_dir or Path.cwd()
-    hook_system = HookSystem(workspace_dir=workspace_dir)
-
-    # 准备工具列表
-    tools = [execute_command_tool]
-    advisors = []
-
-    # 如果启用 skills 功能，添加 ActivateSkillTool 和 SkillsAdvisor
-    if config.skills_enabled:
-        try:
-            activate_skill_tool = ActivateSkillTool()
-            tools.append(activate_skill_tool)
-            skills_advisor = SkillsAdvisor(agent=None, config=config)  # type: ignore
-            advisors.append(skills_advisor)
-            logger.info("已添加 ActivateSkillTool 和 SkillsAdvisor")
-        except Exception as e:
-            logger.warning(f"添加 skills 相关组件失败: {e}")
-
-    # 创建 Agent，SystemPromptAdvisor 会在 BaseAgent 初始化时自动创建
-    agent = BaseAgent(
-        model=config.model_name,
-        provider=provider,
-        tool_groups=tool_groups,
-        tools=tools,
-        advisors=advisors if advisors else None,
-        hook_system=hook_system,
-    )
-    agent.max_context_length = max_context_length
-    
-    # 设置 Session 的上下文配置
-    if config.context_config:
-        agent.session.context_config = config.context_config
-        if not agent.session.context_manager:
-            agent.session.context_manager = ContextManager()
-
-    # 保存MCP客户端引用，以便在shutdown时清理
-    agent._mcp_clients = mcp_clients
-
-    return agent
 
 
 def run_agent_task(agent: BaseAgent, user_input: str, run_loop: AgentRunLoop) -> None:
@@ -331,10 +208,26 @@ async def run_interactive_cli(
 
     config = app_context.config
     logger.info(f"使用配置，工作区目录: {config.workspace_dir}")
-    
-    # 创建 Agent
-    agent = create_agent(config)
-    logger.info(f"Agent 创建完成，模型: {config.model_name}")
+
+    # 获取初始模式
+    default_mode_str = config.composer.default_mode if hasattr(config, 'composer') and config.composer else "Default"
+    try:
+        initial_mode = ComposerMode(default_mode_str)
+    except ValueError:
+        initial_mode = ComposerMode.DEFAULT
+        logger.warning(f"Invalid mode in config: {default_mode_str}, using Default")
+
+    # 使用 AgentFactory 创建初始 Agent
+    if not app_context.agent_factory:
+        raise RuntimeError("AgentFactory 未初始化")
+
+    agent_config = AgentConfig(mode=initial_mode, config=config)
+    agent = app_context.agent_factory.create_agent(agent_config)
+
+    # 保存到 ApplicationContext
+    app_context.current_agent = agent
+
+    logger.info(f"Agent 创建完成，模型: {config.model_name}, 模式: {initial_mode.value}")
 
     session_data = None
     if resume_session_id:
@@ -359,9 +252,11 @@ async def run_interactive_cli(
     renderer = app_context.renderer
     file_manager = get_file_manager()
     file_manager.start_watching()
-    # 创建智能命令 completer
-    composer = ComposerComponent()
-    smart_completer = composer.get_completer()
+    # 创建智能命令 completer，传入 agent_factory 和 app_context
+    composer = ComposerComponent(
+        agent_factory=app_context.agent_factory,
+        app_context=app_context,
+    )
     registry = get_command_registry()
     
     event_bridge = app_context.event_bridge
@@ -372,12 +267,24 @@ async def run_interactive_cli(
         # 主循环
         while True:
             try:
+                # 从配置中读取默认模式
+                config = app_context.config
+                default_mode_str = config.composer.default_mode if hasattr(config, 'composer') and config.composer else "Default"
+
+                # 转换为 ComposerMode 枚举
+                try:
+                    initial_mode = ComposerMode(default_mode_str)
+                except ValueError:
+                    initial_mode = ComposerMode.DEFAULT
+                    logger.warning(f"Invalid mode in config: {default_mode_str}, using Default")
+
                 # 获取用户输入
                 user_input = await composer.show(
                     prompt_text="> ",
                     busy_prompt_text="🤔> ",
                     placeholder="share your ideas...",
                     toolbar_text="Press Ctrl+M to submit, Ctrl+D to exit, /model to select model",
+                    initial_mode=initial_mode,
                 )
                 
                 if not user_input or not user_input.strip():

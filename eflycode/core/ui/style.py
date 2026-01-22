@@ -6,6 +6,14 @@ _DEFAULT_STYPES: Dict[str, str] = {
 
     "composer.toolbar": "#5A5A5A bold",
 
+    # 模式相关样式（粗体显示，颜色由终端决定）
+    "composer.mode.default": "ansiwhite bold",
+    "composer.mode.plan": "ansiyellow bold",
+    "composer.mode.agent": "ansigreen bold",
+    "composer.mode.debug": "ansired bold",
+    "composer.mode.ask": "ansiblue bold",
+    "composer.statusbar": "bg:#222222 #888888",
+
     "select.title": "bold",
     "select.option": "",
     "select.option.selected": "reverse bold",

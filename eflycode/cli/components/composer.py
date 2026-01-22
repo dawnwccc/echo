@@ -20,6 +20,7 @@ from prompt_toolkit.layout.dimension import Dimension
 
 from eflycode.core.ui.style import build_prompt_toolkit_style
 from eflycode.core.ui.errors import UserCanceledError
+from eflycode.core.ui.mode import ComposerMode, ModeManager
 from eflycode.cli.components.smart_completer import SmartCompleter
 
 def build_get_line_prefix(
@@ -57,11 +58,93 @@ def build_placeholder_visible(buffer: Buffer) -> Callable[[], bool]:
 
 class ComposerComponent:
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        agent_factory: Optional['AgentFactory'] = None,
+        app_context: Optional['ApplicationContext'] = None,
+    ) -> None:
         self._completer = SmartCompleter()
+        self._mode_manager = ModeManager(initial_mode=ComposerMode.DEFAULT)
+        self._agent_factory = agent_factory
+        self._app_context = app_context
+        self._toolbar_text = None
+        self._statusbar_control = None  # 状态栏控件，用于刷新
+
+        # 同步初始模式
+        if app_context and app_context.current_agent:
+            try:
+                current_mode = ComposerMode(app_context.current_agent.ROLE)
+                self._mode_manager.set_mode(current_mode)
+            except ValueError:
+                # 如果 ROLE 不是有效的 ComposerMode，使用默认值
+                pass
 
     def get_completer(self) -> SmartCompleter:
         return self._completer
+
+    @property
+    def mode_manager(self) -> ModeManager:
+        """获取模式管理器"""
+        return self._mode_manager
+
+    def _build_statusbar_text(self) -> FormattedText:
+        """构建状态栏文本
+
+        左侧显示当前模式（带颜色），右侧显示工具栏文本
+
+        Returns:
+            FormattedText: 状态栏格式化文本
+        """
+        try:
+            mode = self._mode_manager.current_mode
+            # 使用 ANSI 颜色值
+            mode_style = f"{mode.ansi_color} bold"
+
+            # 左侧：模式标签
+            fragments = [
+                (mode_style, f" {mode.label} "),
+            ]
+
+            # 右侧：工具栏文本（如果有）
+            if self._toolbar_text:
+                # 添加分隔符和工具栏文本
+                fragments.append(("#5A5A5A", "  "))
+                fragments.append(("#5A5A5A", str(self._toolbar_text)))
+
+            return FormattedText(fragments)
+        except Exception as e:
+            # 如果出错，返回简单的文本
+            logger.error(f"Error building statusbar text: {e}")
+            return FormattedText([("", " [Error] ")])
+
+    def _refresh_statusbar(self) -> None:
+        """刷新状态栏显示
+
+        重新构建状态栏文本并更新控件
+        """
+        if self._statusbar_control:
+            # 重新获取文本
+            new_text = self._build_statusbar_text()
+            # 直接更新 FormattedText 对象
+            self._statusbar_control.text = new_text
+
+    def _on_mode_changed(
+        self,
+        old_mode: ComposerMode,
+        new_mode: ComposerMode
+    ) -> None:
+        """模式变化时的回调函数
+
+        Args:
+            old_mode: 旧模式
+            new_mode: 新模式
+        """
+        # 触发 ApplicationContext 的 Agent 切换
+        if self._app_context:
+            self._app_context.switch_agent_mode(new_mode)
+
+        # 刷新状态栏
+        self._refresh_statusbar()
 
     async def show(
         self,
@@ -76,10 +159,22 @@ class ComposerComponent:
         completer: Optional[Completer] = None,
         on_complete: Optional[Union[Callable[[str], bool], Callable[[str], Awaitable[bool]]]] = None,
         on_busy: Optional[Callable[[], bool]] = None,
+        # 新增参数
+        initial_mode: ComposerMode = ComposerMode.DEFAULT,
     ) -> str:
         completer = completer or self._completer
         if on_complete is None:
             on_complete = self._completer.handle_command_async
+
+        # 保存工具栏文本
+        self._toolbar_text = toolbar_text
+
+        # 设置初始模式
+        self._mode_manager.set_mode(initial_mode)
+
+        # 注册模式变化回调
+        self._mode_manager.register_change_callback(self._on_mode_changed)
+
         buffer = Buffer(
             completer=completer,
             multiline=multiline,
@@ -127,8 +222,15 @@ class ComposerComponent:
                 extra_filter=has_focus(buffer),
             )
         )
-        toolbar_window = Window(
-            content=FormattedTextControl(lambda: FormattedText([("class:composer.toolbar", toolbar_text)])),
+
+        # 创建状态栏窗口
+        initial_statusbar_text = self._build_statusbar_text()
+        self._statusbar_control = FormattedTextControl(
+            text=initial_statusbar_text
+        )
+
+        statusbar_window = Window(
+            content=self._statusbar_control,
             height=1,
             dont_extend_height=True,
         )
@@ -172,15 +274,23 @@ class ComposerComponent:
             if completer is None:
                 return
             event.current_buffer.start_completion(select_first=False)
-        
+
+        @kb.add(Keys.BackTab)  # Shift+Tab
+        def _on_shift_tab(event: KeyPressEvent):
+            """切换到下一个模式"""
+            self._mode_manager.next_mode()
+            # 强制 UI 重绘
+            event.app.invalidate()
+
         @kb.add(Keys.ControlD)
         def _on_cancel(event: KeyPressEvent):
             event.app.exit(result=None)
 
         def _container_contents() -> List[Window]:
             contents = [input_window]
-            if toolbar_text is not None:
-                contents.append(toolbar_window)
+            # 使用新的 statusbar_window
+            if self._toolbar_text is not None:
+                contents.append(statusbar_window)
             return contents
         
         def _container_floats() -> List[Float]:
